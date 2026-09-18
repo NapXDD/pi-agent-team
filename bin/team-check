@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# team-check — verify the pi agent team after provider login.
+# Runs PLAN.md steps 7 (model IDs) and 8 (live smoke test).
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 1
+
+pass=0; fail=0
+ok()   { printf '  \033[32mok\033[0m    %s\n' "$1"; pass=$((pass+1)); }
+bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=$((fail+1)); }
+head_() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+
+head_ "1. Auth"
+if ! command -v pi >/dev/null; then bad "pi not on PATH"; exit 1; fi
+ok "pi $(pi --version 2>&1)"
+nv=$(node --version 2>/dev/null); nmaj=${nv#v}; nmaj=${nmaj%%.*}
+if [ -n "$nmaj" ] && [ "$nmaj" -lt 22 ]; then
+  bad "node $nv too old for pi (needs >= 22.19) — run: nvm use 22"
+else
+  ok "node $nv"
+fi
+# Providers and models come from the role files themselves, so adding a role or
+# switching a model cannot leave a stale hardcoded list asserting the wrong thing.
+roledir="$HOME/.pi/agent/agents"
+providers=$(sed -n 's/^provider: *//p' "$roledir"/*.md | sort -u)
+rolemodels=$(sed -n 's/^model: *//p' "$roledir"/*.md | sort -u)
+[ -z "$providers" ] && bad "no provider: lines found in $roledir"
+
+for p in $providers; do
+  if python3 -c "import json,sys;sys.exit(0 if '$p' in json.load(open('$HOME/.pi/agent/auth.json')) else 1)" 2>/dev/null; then
+    ok "$p — credential in auth.json"
+  elif { [ "$p" = anthropic ] && [ -n "${ANTHROPIC_API_KEY:-}" ]; } || \
+       { [ "$p" = opencode-go ] && [ -n "${OPENCODE_API_KEY:-}" ]; } || \
+       { [ "$p" = openai-codex ] && [ -n "${OPENAI_API_KEY:-}" ]; }; then
+    ok "$p — credential in environment"
+  else
+    bad "$p — no credential; run: pi   then /login"
+  fi
+done
+
+# Shape check: catch a wrong-field paste before spending an API call on a 401.
+python3 - <<'PY'
+import json, os, sys
+try:
+    d = json.load(open(os.path.expanduser("~/.pi/agent/auth.json")))
+except Exception:
+    sys.exit(0)
+EXPECT = {"anthropic": ("sk-ant-", "Anthropic"), "opencode-go": ("sk-", "OpenCode Go")}
+for prov, (prefix, label) in EXPECT.items():
+    e = d.get(prov)
+    if not isinstance(e, dict) or e.get("type") != "api_key":
+        continue                      # oauth or absent: nothing to check
+    k = e.get("key", "")
+    if k.startswith("!") or (k and not any(c in k for c in "-. ") and k.isupper()):
+        continue                      # indirection: command or env-var name
+    if not k.startswith(prefix):
+        print(f"  \033[33mwarn\033[0m  {prov} key does not look like a {label} key "
+              f"(expected a '{prefix}' prefix, got {k[:8]!r}, len {len(k)}).")
+        print(f"        A 401 is likely. Re-run: pi  then /login")
+PY
+
+[ "$fail" -gt 0 ] && { printf '\nAuth incomplete; skipping the rest.\n'; exit 1; }
+
+head_ "2. Model IDs (against pi's own catalog)"
+models=$(pi --list-models 2>&1)
+if [ -z "$models" ]; then
+  bad "pi --list-models returned nothing"
+else
+  for m in $rolemodels; do
+    grep -qF -- "$m" <<<"$models" && ok "$m" || bad "$m not in catalog — check the role file"
+  done
+fi
+
+head_ "3. Role definitions"
+./bin/pi-team --list || bad "pi-team --list failed"
+
+head_ "4. Smoke test — implementor (read-write, opencode-go)"
+rm -f /tmp/pi-team-smoke.txt
+./bin/pi-team implementor \
+  "Create the file /tmp/pi-team-smoke.txt containing exactly one line: hello
+Acceptance criteria:
+1. /tmp/pi-team-smoke.txt exists and contains exactly one line, the text 'hello'.
+Validation: wc -l /tmp/pi-team-smoke.txt
+Out of scope: anything else on the filesystem." || bad "implementor exited non-zero"
+if [ -f /tmp/pi-team-smoke.txt ]; then
+  ok "file created: $(tr -d '\n' < /tmp/pi-team-smoke.txt)"
+else
+  bad "implementor did not create the file — tool-calling is broken on opencode-go"
+fi
+
+head_ "5. Smoke test — reviewer (read-only, openai-codex)"
+./bin/pi-team reviewer \
+  "FIRST REVIEW.
+Acceptance criteria:
+1. /tmp/pi-team-smoke.txt exists and contains exactly one line, the text 'hello'.
+Validation: wc -l /tmp/pi-team-smoke.txt
+Report criterion 1 as pass or fail." || bad "reviewer exited non-zero"
+
+head_ "Result"
+printf '  %d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ] && printf '  Team is live. See PLAN.md step 9 to run real work.\n'
+exit $(( fail > 0 ))

@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""
+pi-team — run one role of the plan/code/review team as a pi subagent.
+
+Each role is defined by ~/.pi/agent/agents/<role>.md: YAML-ish frontmatter
+supplies provider/model/thinking/tools, and the body becomes the role's system
+prompt. Same file format the pi-orchestrator package uses, so these definitions
+stay portable if that package is ever adopted.
+
+Usage:
+  pi-team <role> [options] <task...>
+  pi-team <role> [options] -          # read task from stdin
+
+Options:
+  --continue, -c        Continue this role's most recent session
+  --session <id|path>   Resume a specific session
+  --thinking <level>    Override the role's thinking level
+  --json                Machine-readable output (--mode json)
+  --interactive, -i     Drop into pi's TUI instead of print mode
+  --dry-run             Print the pi command and exit
+  --list                List available roles and exit
+
+Sessions are kept per role under ~/.pi/agent/team-sessions/<role>/.
+"""
+import os
+import re
+import sys
+import shutil
+import subprocess
+
+AGENT_DIR = os.path.expanduser("~/.pi/agent/agents")
+SESSION_ROOT = os.path.expanduser("~/.pi/agent/team-sessions")
+THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh"}
+
+
+def die(msg, code=2):
+    print(f"pi-team: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def roles():
+    if not os.path.isdir(AGENT_DIR):
+        return []
+    return sorted(f[:-3] for f in os.listdir(AGENT_DIR) if f.endswith(".md"))
+
+
+def parse_agent(role):
+    path = os.path.join(AGENT_DIR, f"{role}.md")
+    if not os.path.exists(path):
+        die(f"no agent definition at {path}\navailable roles: {', '.join(roles()) or '(none)'}")
+    text = open(path, encoding="utf-8").read()
+    m = re.match(r"^---\r?\n(.*?)\r?\n---\r?\n?(.*)$", text, re.S)
+    if not m:
+        die(f"{path}: missing --- frontmatter block")
+    fm, body = {}, m.group(2).strip()
+    for line in m.group(1).splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        k, sep, v = line.partition(":")
+        if sep:
+            fm[k.strip()] = v.strip()
+
+    if fm.get("enabled", "true").lower() == "false":
+        die(f"agent '{role}' is disabled (enabled: false in {path})")
+    provider, model = fm.get("provider"), fm.get("model")
+    if not provider or not model:
+        die(f"{path}: must define both provider and model")
+
+    thinking = fm.get("thinking", "medium")
+    if thinking not in THINKING_LEVELS:
+        die(f"{path}: thinking must be one of {', '.join(sorted(THINKING_LEVELS))}, got '{thinking}'")
+
+    tools = [t.strip() for t in fm.get("tools", "").split(",") if t.strip()]
+    if not body:
+        die(f"{path}: body (system prompt) is empty")
+    return {"provider": provider, "model": model, "thinking": thinking,
+            "tools": tools, "prompt": body, "path": path}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] == "--list":
+        names = roles()
+        w = max([len(r) for r in names], default=0)
+        for r in names:
+            a = parse_agent(r)
+            rw = "rw" if ("write" in a["tools"] or "edit" in a["tools"]) else "ro"
+            print(f"{r:<{w}}  {a['provider']}/{a['model']}:{a['thinking']}  [{rw}] {','.join(a['tools'])}")
+        return 0
+
+    role, rest = argv[0], argv[1:]
+    if role.startswith("-"):
+        die(f"expected a role name first, got '{role}'\navailable roles: {', '.join(roles()) or '(none)'}")
+    agent = parse_agent(role)
+
+    cont = interactive = dry = as_json = False
+    session = thinking = None
+    task_parts = []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ("--continue", "-c"):
+            cont = True
+        elif a in ("--interactive", "-i"):
+            interactive = True
+        elif a == "--json":
+            as_json = True
+        elif a == "--dry-run":
+            dry = True
+        elif a == "--session":
+            i += 1
+            if i >= len(rest):
+                die("--session needs a value")
+            session = rest[i]
+        elif a == "--thinking":
+            i += 1
+            if i >= len(rest) or rest[i] not in THINKING_LEVELS:
+                die(f"--thinking needs one of {', '.join(sorted(THINKING_LEVELS))}")
+            thinking = rest[i]
+        elif a == "--":
+            task_parts.extend(rest[i + 1:])
+            break
+        else:
+            task_parts.append(a)
+        i += 1
+
+    task = sys.stdin.read() if task_parts == ["-"] else " ".join(task_parts).strip()
+    if not task and not interactive:
+        die("no task given (pass text, '-' to read stdin, or --interactive)")
+
+    session_dir = os.path.join(SESSION_ROOT, role)
+    os.makedirs(session_dir, exist_ok=True)
+
+    if not shutil.which("pi"):
+        die("pi not found on PATH")
+
+    # pi >= 0.85 requires Node >= 22.19; on older Node it dies in a 55KB
+    # minified stack trace about node:fs globSync. Fail readably instead.
+    try:
+        nv = subprocess.run(["node", "--version"], capture_output=True, text=True,
+                            timeout=10).stdout.strip()
+        major = int(nv.lstrip("v").split(".")[0])
+    except Exception:
+        nv, major = "", None
+    if major is not None and major < 22:
+        die(f"node {nv} is too old for pi (needs >= 22.19).\n"
+            f"  fix for this shell:   nvm use 22\n"
+            f"  fix permanently:      nvm alias default 22")
+
+    args = ["pi",
+            "--session-dir", session_dir,
+            "--no-extensions",
+            "--provider", agent["provider"],
+            "--model", agent["model"],
+            "--thinking", thinking or agent["thinking"],
+            "--append-system-prompt", agent["prompt"]]
+    if agent["tools"]:
+        args += ["--tools", ",".join(agent["tools"])]
+    if session:
+        args += ["--session", session]
+    elif cont:
+        args.append("--continue")
+    if not interactive:
+        args += ["--mode", "json"] if as_json else []
+        args.append("-p")
+    if task:
+        args.append(f"Task from orchestrator:\n\n{task}")
+
+    if dry:
+        import shlex
+        print(" ".join(shlex.quote(a) for a in args))
+        return 0
+    return subprocess.call(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
