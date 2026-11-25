@@ -6,8 +6,11 @@ as its own `pi` process, launched by a single script.
 
 The point is the **separation**: the roles that think about the code cannot edit
 it, and the role that edits it is handed a brief rather than a conversation.
-Read-only is enforced by `pi`'s `--tools` allowlist, not by asking the model
-nicely.
+Only the implementor has `edit`, enforced by `pi`'s `--tools` allowlist. The
+researcher and reviewer also have `write`, but only so they can save their own
+plan or review file when a project's `AGENTS.md` asks for one (see
+[Project AGENTS.md workflow](#project-agentsmd-workflow)). That limit is set by
+the prompt, not enforced by pi.
 
 ## Two workflows
 
@@ -29,8 +32,15 @@ you write plan.md → [pre-flight] → implement → review → [≤2 fix rounds
 ```
 
 ```bash
-./bin/pi-team orchestrator-automaton -i                  # researcher plans
-./bin/pi-team orchestrator-hybrid - < plan.md            # you planned
+pi-team orchestrator-automaton -i                  # researcher plans
+pi-team orchestrator-hybrid - < plan.md            # you planned
+```
+
+Run these from the root of the project you are working on. `pi-team` must be on
+your PATH so the orchestrator can call it from any project:
+
+```bash
+ln -s "$PWD/bin/pi-team" ~/.local/bin/pi-team
 ```
 
 Hybrid exists because planning is the step that benefits most from a
@@ -55,11 +65,11 @@ makes the loop terminate instead of drifting.
 
 | Role | Definition | Provider | Model | Thinking | Access |
 |---|---|---|---|---|---|
-| Orchestrator (automaton) | `orchestrator-automaton.md` | openai-codex | `gpt-5.6-sol` | medium | read-only |
+| Orchestrator (automaton) | `orchestrator-automaton.md` | opencode-go | `deepseek-v4.1-flash` | low | read-only |
 | Orchestrator (hybrid) | `orchestrator-hybrid.md` | openai-codex | `gpt-5.6-sol` | medium | read-only |
-| Plan | `researcher.md` | openai-codex | `gpt-5.6-sol` | medium | read-only |
-| Code | `implementor.md` | opencode-go | `deepseek-v4.1-flash` | off | **read-write** |
-| Review | `reviewer.md` | openai-codex | `gpt-5.6-sol` | medium | read-only |
+| Plan | `researcher.md` | openai-codex | `gpt-5.6-sol` | medium | read-only + workflow docs |
+| Code | `implementor.md` | opencode-go | `deepseek-v4.1-flash` | max | **read-write** |
+| Review | `reviewer.md` | openai-codex | `gpt-5.6-sol` | medium | read-only + review file |
 
 Only the implementor has `edit`/`write`. The two orchestrators are alternatives,
 never both in one run — nothing stops you starting one from the other, so don't.
@@ -68,8 +78,9 @@ never both in one run — nothing stops you starting one from the other, so don'
 > orchestrating, Fable planning, Opus reviewing, on the reasoning that review is
 > open-ended defect-hunting and deserved the strongest model.
 > [PLAN.md](PLAN.md#sonnet-orchestrator--opus-reviewer) still argues that case.
-> They now all run `gpt-5.6-sol` at `medium`, so that differentiation is gone:
-> the reviewer is no longer stronger than the roles it checks. The role prompts,
+> Plan, review and the hybrid orchestrator now all run `gpt-5.6-sol` at
+> `medium` (the automaton orchestrator runs `deepseek-v4.1-flash`), so that differentiation
+> is gone: the reviewer is no longer stronger than the roles it checks. The role prompts,
 > not the model tier, are doing the separating.
 
 ## Requirements
@@ -177,6 +188,41 @@ Sessions are per role under `~/.pi/agent/team-sessions/<role>/`; `-c` continues
 the most recent, `--session <id>` resumes a specific one. Every role runs with
 `--no-extensions` so a subagent cannot recurse back into the team setup.
 
+## Project AGENTS.md workflow
+
+pi loads `AGENTS.md` (or `CLAUDE.md`) from the working directory and the
+folders above it into every role. Each role prompt opens with a **Project
+workflow comes first** section. If that file defines a plan / implement /
+review workflow, the roles take on its planning, implementation and review
+roles, and it overrides the role prompt wherever they differ.
+
+In that **file mode**:
+
+- The researcher writes `plan.md` (and `todo.md` for a large plan) where
+  `AGENTS.md` says; the implementor writes the change reports; the reviewer
+  writes the next `review-<index>.md` and ends it with `Approved` when nothing
+  needs fixing.
+- Each role replies with file paths and a short summary. The orchestrator
+  passes **paths, not text**, so a plan is never paraphrased and never copied
+  through three contexts. That is also the cheapest way to hand work over.
+- The human plan gate stays. After you approve, the orchestrator runs each
+  `todo.md` checkpoint in turn: implement → first review → check the review's
+  last line → tick the checkpoint and move on, or fix. At most two fix rounds
+  per checkpoint, then it hands back to you.
+- **Replanning.** Every review that isn't `Approved` goes back to the
+  implementor, which decides per finding whether to fix it or turn it into a
+  `plan-request-<index>.md` plus pause report. In the second case its reply
+  starts with `PLAN REQUEST: … | PAUSE REPORT: …`, and the orchestrator hands
+  both paths to the researcher, stops for your approval, re-reads `todo.md`,
+  resumes the implementor on the new plan and runs a first review. At most one
+  replan per checkpoint. In hybrid, replanning comes back to you.
+- The implementor does one checkpoint per call. The orchestrator starts the
+  next, which is how `AGENTS.md`'s "continue to the next checkpoint" is carried
+  out.
+
+With no such `AGENTS.md`, the roles behave as described in the rest of this
+README, and the researcher and reviewer do not write at all.
+
 ## Verify
 
 ```bash
@@ -266,7 +312,7 @@ or a bad `thinking:` value before you spend an API call:
 
 ### Changing thinking level
 
-`thinking:` accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`. The
+`thinking:` accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The
 runner validates it strictly rather than silently defaulting, so a typo is a
 clean error. To try a level without editing the file:
 
@@ -274,12 +320,12 @@ clean error. To try a level without editing the file:
 ./bin/pi-team researcher --thinking xhigh "Plan: ..."
 ```
 
-Leave the implementor at `thinking: off`. That is deliberate — the DeepSeek V4
-API requires `reasoning_content` to be replayed verbatim on assistant messages
-carrying `tool_calls`, and `off` avoids the code path entirely. pi does handle
-it correctly (`compat.requiresReasoningContentOnAssistantMessages`,
-`thinkingFormat: "deepseek"`), so this is belt-and-braces, not a workaround for
-a pi bug.
+The implementor runs at `thinking: max`. The DeepSeek V4 API requires
+`reasoning_content` to be replayed verbatim on assistant messages carrying
+`tool_calls`; pi handles this (`compat.requiresReasoningContentOnAssistantMessages`,
+`thinkingFormat: "deepseek"`). If you hit `400 ... reasoning_content in the
+thinking mode must be passed back`, drop it to `thinking: off`, which avoids
+that code path entirely.
 
 ### Switching provider
 

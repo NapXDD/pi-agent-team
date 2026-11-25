@@ -74,26 +74,27 @@ head_ "3. Role definitions"
 ./bin/pi-team --list || bad "pi-team --list failed"
 
 head_ "4. Smoke test — implementor (read-write, opencode-go)"
-rm -f /tmp/pi-team-smoke.txt
+rm -f pi-team-smoke.txt
 ./bin/pi-team implementor \
-  "Create the file /tmp/pi-team-smoke.txt containing exactly one line: hello
+  "Create the file pi-team-smoke.txt containing exactly one line: hello
 Acceptance criteria:
-1. /tmp/pi-team-smoke.txt exists and contains exactly one line, the text 'hello'.
-Validation: wc -l /tmp/pi-team-smoke.txt
+1. pi-team-smoke.txt exists and contains exactly one line, the text 'hello'.
+Validation: wc -l pi-team-smoke.txt
 Out of scope: anything else on the filesystem." || bad "implementor exited non-zero"
-if [ -f /tmp/pi-team-smoke.txt ]; then
-  ok "file created: $(tr -d '\n' < /tmp/pi-team-smoke.txt)"
+if [ -f pi-team-smoke.txt ]; then
+  ok "file created: $(tr -d '\n' < pi-team-smoke.txt)"
 else
-  bad "implementor did not create the file — tool-calling is broken on opencode-go"
+  bad "implementor did not create the file — check its report above (refusal vs. tool-calling failure)"
 fi
 
 head_ "5. Smoke test — reviewer (read-only, openai-codex)"
 ./bin/pi-team reviewer \
   "FIRST REVIEW.
 Acceptance criteria:
-1. /tmp/pi-team-smoke.txt exists and contains exactly one line, the text 'hello'.
-Validation: wc -l /tmp/pi-team-smoke.txt
+1. pi-team-smoke.txt exists and contains exactly one line, the text 'hello'.
+Validation: wc -l pi-team-smoke.txt
 Report criterion 1 as pass or fail." || bad "reviewer exited non-zero"
+rm -f pi-team-smoke.txt
 
 head_ "Result"
 printf '  %d passed, %d failed\n' "$pass" "$fail"
